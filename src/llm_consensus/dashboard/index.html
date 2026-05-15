@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>LLM Consensus — Live</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 16px; color: #58a6ff; }
+  textarea, input { width: 100%; box-sizing: border-box; background: #161b22;
+                    color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+                    padding: 8px; font-family: inherit; }
+  textarea { min-height: 90px; }
+  button { background: #238636; color: #fff; border: 0; padding: 8px 14px;
+           border-radius: 6px; cursor: pointer; font-weight: 600; }
+  button:disabled { background: #30363d; cursor: not-allowed; }
+  .row { display: flex; gap: 12px; margin: 8px 0; }
+  .col { flex: 1; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+          padding: 12px; margin-bottom: 12px; }
+  .agent { display: inline-block; padding: 2px 8px; border-radius: 4px;
+           margin-right: 6px; background: #21262d; font-size: 12px; }
+  .score { float: right; font-weight: 600; }
+  .score.high { color: #56d364; } .score.mid { color: #e3b341; }
+  .score.low { color: #f85149; }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 4px 0; }
+  details summary { cursor: pointer; color: #8b949e; }
+  .node-tag { font-size: 11px; color: #8b949e; text-transform: uppercase;
+              letter-spacing: 0.5px; }
+</style>
+</head>
+<body>
+<h1>LLM Consensus — Live Dashboard</h1>
+
+<div class="card">
+  <label>Task</label>
+  <input id="task" value="Review this Python function" />
+  <label style="margin-top:8px;display:block">Output to review</label>
+  <textarea id="output">def add(a, b): return a + b</textarea>
+  <div class="row" style="margin-top:8px">
+    <div class="col"><label>Threshold</label><input id="threshold" value="0.95" /></div>
+    <div class="col"><label>Max rounds</label><input id="max_rounds" value="5" /></div>
+    <div class="col"><label>Disagreement threshold</label><input id="dis" value="0.10" /></div>
+  </div>
+  <button id="go" style="margin-top:12px">Run Consensus</button>
+</div>
+
+<div id="log"></div>
+
+<div class="card" id="feedback-card" hidden>
+  <strong>Teach the user-preference agent</strong>
+  <p style="color:#8b949e;font-size:12px">Free-text only. It learns your taste over time.</p>
+  <textarea id="comment" placeholder="e.g. 'Too verbose. I prefer no docstrings on one-line helpers.'"></textarea>
+  <button id="send-feedback" style="margin-top:8px">Save feedback</button>
+</div>
+
+<script>
+let currentSession = null, lastRound = 0, lastOutput = "";
+
+function scoreClass(s) { return s >= 0.9 ? "high" : s >= 0.7 ? "mid" : "low"; }
+
+function renderNode(node, update) {
+  const log = document.getElementById("log");
+  const card = document.createElement("div");
+  card.className = "card";
+  let body = `<div class="node-tag">${node}</div>`;
+
+  if (update.latest_reviews) {
+    body += update.latest_reviews.map(r =>
+      `<div><span class="agent">${r.agent}</span>
+       <span class="score ${scoreClass(r.score)}">${r.score.toFixed(2)}</span>
+       <pre>${(r.feedback || "").replace(/</g,"&lt;")}</pre></div>`
+    ).join("");
+  }
+  if (update.latest_score !== undefined) {
+    body += `<div><strong>aggregated</strong>
+             <span class="score ${scoreClass(update.latest_score)}">${update.latest_score.toFixed(3)}</span></div>`;
+    if (update.latest_weights) {
+      body += `<details><summary>bandit weights</summary><pre>${
+        JSON.stringify(update.latest_weights, null, 2)}</pre></details>`;
+    }
+  }
+  if (update.stop_reason) {
+    body += `<div><strong>stop_reason:</strong> ${update.stop_reason}</div>`;
+  }
+  card.innerHTML = body;
+  log.appendChild(card);
+
+  if (update.round) lastRound = update.round;
+}
+
+document.getElementById("go").addEventListener("click", async () => {
+  document.getElementById("log").innerHTML = "";
+  document.getElementById("feedback-card").hidden = true;
+  const btn = document.getElementById("go");
+  btn.disabled = true; btn.textContent = "Running...";
+
+  currentSession = crypto.randomUUID();
+  lastOutput = document.getElementById("output").value;
+
+  const body = {
+    session_id: currentSession,
+    task: document.getElementById("task").value,
+    phase: "review",
+    current_output: lastOutput,
+    threshold: parseFloat(document.getElementById("threshold").value),
+    max_rounds: parseInt(document.getElementById("max_rounds").value, 10),
+    disagreement_threshold: parseFloat(document.getElementById("dis").value),
+  };
+
+  const res = await fetch("/consensus/stream", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, {stream: true});
+    const parts = buf.split("\n\n");
+    buf = parts.pop();
+    for (const part of parts) {
+      const lines = part.split("\n");
+      let event = "message", data = "";
+      for (const l of lines) {
+        if (l.startsWith("event:")) event = l.slice(6).trim();
+        else if (l.startsWith("data:")) data += l.slice(5).trim();
+      }
+      if (event === "node" && data) {
+        const parsed = JSON.parse(data);
+        renderNode(parsed.node, parsed.update);
+      }
+      if (event === "done") {
+        document.getElementById("feedback-card").hidden = false;
+      }
+    }
+  }
+  btn.disabled = false; btn.textContent = "Run Consensus";
+});
+
+document.getElementById("send-feedback").addEventListener("click", async () => {
+  const comment = document.getElementById("comment").value.trim();
+  if (!comment || !currentSession) return;
+  const r = await fetch("/feedback", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      session_id: currentSession,
+      round: lastRound,
+      output_snippet: lastOutput,
+      comment,
+    }),
+  });
+  const j = await r.json();
+  alert(`Saved. Total preference records: ${j.total}`);
+  document.getElementById("comment").value = "";
+});
+</script>
+</body>
+</html>
